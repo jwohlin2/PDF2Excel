@@ -430,10 +430,19 @@ except Exception:
 
 _tesseract_env = os.environ.get("PDF2EXCEL_TESSERACT")
 _tesseract_default = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-for candidate in (_tesseract_env, _tesseract_default if _tesseract_default.exists() else None):
+
+_tesseract_which = shutil.which("tesseract")
+for candidate in (
+    _tesseract_env,
+    _tesseract_default if _tesseract_default.exists() else None,
+    Path(_tesseract_which) if _tesseract_which else None,
+):
     if not candidate:
         continue
-    cand_path = Path(candidate)
+    try:
+        cand_path = Path(candidate)
+    except TypeError:
+        continue
     if cand_path.exists():
         pytesseract.pytesseract.tesseract_cmd = str(cand_path)
         break
@@ -1136,6 +1145,43 @@ def make_windows_from_ink_fenced(img_gray, headers_xy, row_ys, fences):
             x1 = min(W, int(x0 + max(110, int(0.14*W))))
         wins[str(lab)] = (int(x0), int(x1))
     return wins
+
+
+def _normalize_column_windows(win_by_lab, headers_xy, col_left, col_right):
+    """Return a validated mapping of column windows or a safe fallback."""
+    fallback = {
+        str(lab): (int(col_left[i]), int(col_right[i]))
+        for i, (lab, _cx) in enumerate(headers_xy)
+    }
+    if not headers_xy:
+        return fallback
+    if not isinstance(win_by_lab, dict) or not win_by_lab:
+        return fallback
+
+    try:
+        ordered = {}
+        last_x1 = None
+        for i, (lab, cx) in enumerate(headers_xy):
+            key = str(lab)
+            if key not in win_by_lab:
+                return fallback
+            x0, x1 = win_by_lab[key]
+            x0 = int(x0); x1 = int(x1)
+            if x1 <= x0:
+                return fallback
+            if (x1 - x0) < 80:
+                return fallback
+            if x1 <= int(cx) + 30:
+                return fallback
+            if x0 < int(cx) + 20:
+                return fallback
+            if last_x1 is not None and x0 < last_x1 - 10:
+                return fallback
+            ordered[key] = (x0, x1)
+            last_x1 = x1
+        return ordered
+    except Exception:
+        return fallback
 
 # --- Rightmost numeric token reader ---
 _NUM_RE_RM = _re.compile(r"\(?\s*\$?-?\d[\d,]*(?:\.\d+)?\s*\)?")
@@ -3275,28 +3321,22 @@ def parse_by_cell_ocr(img: Image.Image, page_num: int = 1) -> Optional[pd.DataFr
         else:
             xR = W - 6                  # last column can go to the page edge
         col_fences.append((xL, xR))
-    try:
-        print("[FENCES]", col_fences)
-    except Exception:
-        pass
+    if DEBUG_MODE:
+        try:
+            print("[FENCES]", col_fences)
+        except Exception:
+            pass
+    win_by_lab = None
     try:
         win_by_lab = make_windows_from_ink_fenced(img_gray, headers_xy, row_ys, col_fences)
     except Exception:
-        win_by_lab = {lab: (int(col_left[i]), int(col_right[i])) for i, (lab, _cx) in enumerate(headers_xy)}
-    # Guardrails: windows must be non-overlapping and right of header centers
-    cmap = dict(headers_xy)
-    last_x1 = -1
-    for lab,(x0,x1) in win_by_lab.items():
-        assert x1 - x0 >= 80, f"Window too narrow for {lab}: {(x0,x1)}"
-        assert x1 > int(cmap[lab] + 30), f"{lab} x1 <= header center"
-        assert x0 >= int(cmap[lab] + 20), f"{lab} x0 too far left"
-        assert x0 >= last_x1 - 10, f"{lab} window overlaps previous"
-        last_x1 = x1
-    # Print the windows actually used
-    try:
-        print("[WIN]", {lab: (int(a), int(b)) for lab, (a, b) in win_by_lab.items()})
-    except Exception:
-        pass
+        win_by_lab = None
+    win_by_lab = _normalize_column_windows(win_by_lab, headers_xy, col_left, col_right)
+    if DEBUG_MODE:
+        try:
+            print("[WIN]", {lab: (int(a), int(b)) for lab, (a, b) in win_by_lab.items()})
+        except Exception:
+            pass
     # Convert to ordered lists for reader
     col_windows = [win_by_lab.get(lab, (int(col_left[i]), int(col_right[i]))) for i, (lab, _cx) in enumerate(headers_xy)]
     win_left = [int(a) for (a, b) in col_windows]
