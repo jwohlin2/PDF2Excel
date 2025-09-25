@@ -29,12 +29,13 @@ from __future__ import annotations
 #   S5 Post: order_like_statement, _unify_columns, _collapse_duplicates, _process_parsed_data, finalize
 
 # region [S0] Imports & Constants
-import os, re, json, tempfile, subprocess, traceback
+import os, re, json, tempfile, subprocess, traceback, shutil
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import numpy as np
 import pandas as pd
 from PIL import Image
+from datetime import datetime
 
 # ---------- DEBUG DIRECTORY ----------
 try:
@@ -71,10 +72,77 @@ try:
 except Exception:
     _sk_sobel = None
 
-# region [S6] Excel I/O (imported helpers)
-# Moved to module for clarity; behavior unchanged.
-from pdf2excel.excel_io import _safe_write_excel, _is_file_locked
-# endregion
+# region [S6] Excel I/O helpers (inlined for portability)
+
+
+def autosize_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, sheet_name: str) -> None:
+    """Best-effort column autosize for the provided worksheet."""
+    try:
+        worksheet = writer.sheets.get(sheet_name)
+        if worksheet is None:
+            return
+        for idx, col in enumerate(df.columns):
+            series = df[col].astype(str)
+            max_len = max([len(col)] + [len(str(v)) for v in series])
+            worksheet.set_column(idx, idx, min(max_len + 2, 60))
+    except Exception:
+        # Autosize is purely cosmetic; ignore any issues.
+        pass
+
+
+def _ensure_parent_dir(path_str: str) -> None:
+    Path(path_str).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
+
+def _is_file_locked(path_str: str) -> bool:
+    """Return True if the given file appears to be locked/open elsewhere."""
+    p = Path(path_str)
+    if not p.exists():
+        return False
+    try:
+        with open(p, "r+b"):
+            pass
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+
+
+def _safe_write_excel(dfs: List[pd.DataFrame], out_path: str, engine: Optional[str] = None) -> str:
+    """Write the provided DataFrames to ``out_path`` atomically."""
+    _ensure_parent_dir(out_path)
+    out_p = Path(out_path)
+    stem = out_p.stem
+    tmp_p = out_p.with_name(f"{stem}.tmp.{os.getpid()}.xlsx")
+
+    if engine is None:
+        try:
+            import xlsxwriter  # noqa: F401
+            engine = "xlsxwriter"
+        except Exception:
+            engine = "openpyxl"
+
+    dfs = [df for df in (dfs or []) if isinstance(df, pd.DataFrame)]
+    if not dfs:
+        dfs = [pd.DataFrame()]
+
+    with pd.ExcelWriter(tmp_p, engine=engine) as writer:
+        for idx, df in enumerate(dfs, start=1):
+            sheet = "Extracted" if idx == 1 else f"Table {idx}"
+            df.to_excel(writer, index=False, sheet_name=sheet)
+            if engine == "xlsxwriter":
+                autosize_sheet(writer, df, sheet)
+    try:
+        os.replace(tmp_p, out_p)
+        return str(out_p)
+    except PermissionError:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        alt_p = out_p.with_name(f"{stem}_{ts}.xlsx")
+        shutil.move(tmp_p, alt_p)
+        return str(alt_p)
+
+
 # --- Optional fuzzy matching (safe fallback if not installed) ---
 try:
     from thefuzz import fuzz  # pip install thefuzz[speedup]
@@ -277,8 +345,11 @@ def run_llm_fixer(payload: dict, tmpdir: Path) -> dict:
         "-p", f"{prompt_sys}\nJSON:\n{user}\n",
         "--grammar", gpath.as_posix(),
     ]
+    run_kwargs = dict(capture_output=True, text=True, timeout=LLM_TIMEOUT_S)
+    if LLAMA_BIN:
+        run_kwargs["cwd"] = str(LLAMA_BIN)
     try:
-        p = subprocess.run(cmd, cwd=str(LLAMA_BIN), capture_output=True, text=True, timeout=LLM_TIMEOUT_S)
+        p = subprocess.run(cmd, **run_kwargs)
     except subprocess.TimeoutExpired:
         return {"ops": []}
     except FileNotFoundError:
@@ -308,38 +379,65 @@ DIGIT    ::= %x30-39
 _        ::= ( %x09 | %x0A | %x0D | %x20 )*
 """
 
-# -------------------- EDIT THESE PATHS --------------------
-BASE_DIR     = Path(r"D:\Pdf2ExcelOffline")
-POPPLER_BIN  = BASE_DIR / "poppler-bin"
-LLAMA_BIN    = BASE_DIR / "llama-bin"
-LLAMA_EXE    = LLAMA_BIN / "llama-mtmd-cli.exe"          # text-only is fine
-# Central debug directory: HARD-WIRED for reliability
-# All diagnostics are written here regardless of working directory.
-HARD_DEBUG_DIR = Path(r"D:\Pdf2ExcelOffline\__debug__")
+# -------------------- Runtime paths & configuration --------------------
+
+
+def _resolve_optional_path(*candidates) -> Optional[Path]:
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            path = Path(cand).expanduser()
+        except TypeError:
+            continue
+        if path.exists():
+            return path
+    return None
+
+
+BASE_DIR = _resolve_optional_path(os.environ.get("PDF2EXCEL_BASE_DIR")) or Path.cwd()
+POPPLER_BIN = _resolve_optional_path(
+    os.environ.get("PDF2EXCEL_POPPLER"),
+    BASE_DIR / "poppler-bin",
+)
+MODEL_TXT = _resolve_optional_path(
+    os.environ.get("PDF2EXCEL_MODEL"),
+    BASE_DIR / "models" / "qwen2.5-vl-7b-instruct-q4_k_m.gguf",
+)
+LLAMA_EXE = _resolve_optional_path(
+    os.environ.get("PDF2EXCEL_LLAMA_EXE"),
+    BASE_DIR / "llama-bin" / "llama-mtmd-cli.exe",
+)
+LLAMA_BIN = (
+    LLAMA_EXE.parent if LLAMA_EXE else _resolve_optional_path(os.environ.get("PDF2EXCEL_LLAMA_BIN"))
+)
+
+HARD_DEBUG_DIR = _resolve_optional_path(
+    os.environ.get("PDF2EXCEL_DEBUG_DIR"),
+    BASE_DIR / "__debug__",
+    Path(os.getcwd()) / "__debug__",
+)
+if HARD_DEBUG_DIR is None:
+    HARD_DEBUG_DIR = Path(os.getcwd()) / "__debug__"
 try:
     HARD_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 except Exception:
     pass
-# Ensure all debug routines respect the unified project debug dir
 try:
     DEBUG_DIR = Path(DBG_DIR)
 except Exception:
     DEBUG_DIR = HARD_DEBUG_DIR
 
+_tesseract_env = os.environ.get("PDF2EXCEL_TESSERACT")
+_tesseract_default = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+for candidate in (_tesseract_env, _tesseract_default if _tesseract_default.exists() else None):
+    if not candidate:
+        continue
+    cand_path = Path(candidate)
+    if cand_path.exists():
+        pytesseract.pytesseract.tesseract_cmd = str(cand_path)
+        break
 
-# Tesseract (Windows)
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-MODEL_TXT = Path(r"D:\Pdf2ExcelOffline\models\qwen2.5-vl-7b-instruct-q4_k_m.gguf")
-LLAMA_EXE = Path(r"D:\Pdf2ExcelOffline\llama-bin\llama-mtmd-cli.exe")
-try:
-    MODEL_TXT
-except NameError:
-    MODEL_TXT = None
-
-try:
-    LLAMA_EXE
-except NameError:
-    LLAMA_EXE = None
 
 # -------------------- OCR / LLM KNOBS --------------------
 OCR_CONF_THRESH   = 30   # was 40; too strict for scanned prints
@@ -2486,44 +2584,6 @@ def finalize(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def save_table(df, out_xlsx):
-    # --- SAVE GUARD: never write a blank workbook ---
-    import pandas as pd
-    rows, cols = df.shape
-    print(f"[SAVE] shape={df.shape} columns={list(df.columns)}")
-    assert rows > 0 and cols > 1, f"save_table: nothing to write, shape={df.shape}"
-
-    # quick sanity rows we care about
-    try:
-        probe = df.loc[df["Category"].astype(str).str.contains("marketing|memberships|interest|wages", case=False, regex=True), :]
-        if not getattr(probe, 'empty', True):
-            print(probe)
-    except Exception:
-        pass
-
-    # write xlsx
-    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as xw:
-        df.to_excel(xw, index=False, sheet_name="Sheet1")
-
-    # also write a sidecar CSV so we can inspect quickly
-    csv_path = out_xlsx.replace(".xlsx", "_debug.csv")
-    try:
-        df.to_csv(csv_path, index=False)
-    except Exception:
-        pass
-    print(f"[SAVE] wrote {out_xlsx}  rows={rows}  (csv: {csv_path})")
-def _safe_write_excel(tables, out_xlsx):
-    import pandas as pd
-    if isinstance(tables, list) and tables and isinstance(tables[0], pd.DataFrame):
-        try:
-            df = pd.concat(tables, ignore_index=True)
-        except Exception:
-            df = tables[0]
-    else:
-        df = tables if isinstance(tables, pd.DataFrame) else pd.DataFrame()
-    save_table(df, out_xlsx)
-    return out_xlsx
-
 def order_like_statement(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["__rank"] = df["Category"].map(lambda s: ORDER_RANK.get(s, 99_999))
@@ -2710,10 +2770,14 @@ def pdf_or_images_to_pages(paths: List[Path] | List[str], dpi: int = 300) -> Lis
             ext = p.suffix.lower()
             if ext == ".pdf":
                 data = p.read_bytes()
+                kwargs = {"dpi": dpi}
+                if POPPLER_BIN:
+                    kwargs["poppler_path"] = str(POPPLER_BIN)
                 try:
-                    imgs = convert_from_bytes(data, dpi=dpi, poppler_path=str(POPPLER_BIN))
+                    imgs = convert_from_bytes(data, **kwargs)
                 except Exception:
-                    imgs = convert_from_bytes(data, dpi=dpi)
+                    kwargs.pop("poppler_path", None)
+                    imgs = convert_from_bytes(data, **kwargs)
                 for im in imgs:
                     out.append(ensure_upright(im.convert("RGB")))
             elif ext in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
@@ -5962,7 +6026,6 @@ def run_once_cli(input_path: str, output_path: str = "extracted.xlsx") -> str:
     auto_ops = _build_auto_ops_for_missing_totals_v3(merged)
     fixed = apply_edit_script(merged.copy(), auto_ops)
     fixed = finalize_v3(fixed)
-    from pdf2excel.excel_io import _safe_write_excel
     saved = _safe_write_excel([fixed], output_path)
     return saved
 
