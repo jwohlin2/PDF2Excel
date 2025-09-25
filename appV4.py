@@ -430,6 +430,7 @@ except Exception:
 
 _tesseract_env = os.environ.get("PDF2EXCEL_TESSERACT")
 _tesseract_default = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+
 _tesseract_which = shutil.which("tesseract")
 for candidate in (
     _tesseract_env,
